@@ -1,20 +1,14 @@
-import os
-import pathlib
 from typing import Optional
 
-import easy_handeye2_msgs.msg
 import tf2_ros
-import yaml
-from tf2_ros import Buffer, TransformListener, TransformBroadcaster
-from rosidl_runtime_py import message_to_yaml, set_message_fields
-from easy_handeye2_msgs.msg import Sample, SampleList
+from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 import rclpy
 from rclpy.time import Duration, Time
 
-from easy_handeye2 import SAMPLES_DIRECTORY
 from easy_handeye2.handeye_calibration import HandeyeCalibrationParameters
-
-import easy_handeye2
+from easy_handeye2.handeye_dataset import (DiversityConfig, DiversityFilter, SampleDataset, SampleGate,
+                                           SampleGateConfig)
+from easy_handeye2_msgs.msg import Sample, SampleList
 
 
 class HandeyeSampler:
@@ -40,11 +34,22 @@ class HandeyeSampler:
         used to publish the calibration after saving it
         """
 
-        # internal input data
-        self.samples: easy_handeye2.msg.SampleList = SampleList()
-        """
-        list of acquired samples
-        """
+        gate_cfg = SampleGateConfig(
+            min_translation=float(self.node.declare_parameter('auto_snapshot.translation_gate', 0.01).value),
+            min_rotation_deg=float(self.node.declare_parameter('auto_snapshot.rotation_gate_deg', 5.0).value),
+            min_interval_sec=float(self.node.declare_parameter('auto_snapshot.min_interval', 0.75).value),
+        )
+        diversity_cfg = DiversityConfig(
+            min_translation=float(self.node.declare_parameter('diversity.min_translation', 0.02).value),
+            min_rotation_deg=float(self.node.declare_parameter('diversity.min_rotation_deg', 7.5).value),
+            max_samples=int(self.node.declare_parameter('diversity.max_samples', 250).value),
+        )
+        self.dataset = SampleDataset(self.node, handeye_parameters, SampleGate(gate_cfg), DiversityFilter(diversity_cfg))
+        self.samples: SampleList = self.dataset.samples
+        self.auto_snapshot_period = float(self.node.declare_parameter('auto_snapshot.period', 0.0).value)
+        self.auto_snapshot_timer = None
+        if self.auto_snapshot_period > 0.0:
+            self.auto_snapshot_timer = self.node.create_timer(self.auto_snapshot_period, self._auto_snapshot_callback)
 
     def wait_for_tf_init(self) -> bool:
         """
@@ -117,57 +122,58 @@ class HandeyeSampler:
         return self._get_transforms()
 
     def take_sample(self) -> bool:
-        """
-        Samples the transformations and appends the sample to the list.
-        """
+        """Samples the transformations and appends the sample to the dataset."""
         try:
-            self.node.get_logger().info("Taking a sample...")
-            self.node.get_logger().info("all frames: " + self.tfBuffer.all_frames_as_string())
+            self.node.get_logger().info('Taking a sample...')
+            self.node.get_logger().info('all frames: ' + self.tfBuffer.all_frames_as_string())
             sample = self._get_transforms()
             if sample is None:
                 return False
-
-            self.node.get_logger().info("Got a sample")
-            new_samples = self.samples.samples
-            new_samples.append(sample)
-            self.samples.samples = new_samples
-            return True
-        except:
+            diff = self.dataset.difference_to_last(sample)
+            accepted = self.dataset.add(sample)
+            self.samples = self.dataset.samples
+            if accepted:
+                if diff:
+                    self.node.get_logger().info(
+                        f'Accepted sample #{len(self.samples.samples)} '
+                        f'(Δt={diff.translation:.4f}m Δr={diff.rotation_deg:.2f}°)')
+                else:
+                    self.node.get_logger().info(f'Accepted first sample')
+            else:
+                self.node.get_logger().info('Sample rejected by auto gate')
+            return accepted
+        except Exception as exc:  # pragma: no cover - defensive
+            self.node.get_logger().error(f'Failed to take sample: {exc}')
             return False
 
+    def _auto_snapshot_callback(self):
+        sample = self._get_transforms()
+        if sample is None:
+            return
+        diff = self.dataset.difference_to_last(sample)
+        if self.dataset.add(sample):
+            self.samples = self.dataset.samples
+            if diff:
+                self.node.get_logger().info(
+                    f'Auto snapshot accepted (Δt={diff.translation:.4f}m Δr={diff.rotation_deg:.2f}°)')
+            else:
+                self.node.get_logger().info('Auto snapshot seeded first sample')
+
     def remove_sample(self, index: int) -> int:
-        """
-        Removes a sample from the list. Returns the updated number of samples
-        """
-        if 0 <= index < len(self.samples.samples):
-            new_samples = self.samples.samples
-            del new_samples[index]
-            self.samples.samples = new_samples
+        """Removes a sample from the list and persists the change."""
+        self.dataset.remove(index)
+        self.samples = self.dataset.samples
         return len(self.samples.samples)
 
     def get_samples(self) -> easy_handeye2_msgs.msg.SampleList:
-        """
-        Returns the samples accumulated so far.
-        """
-        return self.samples
-
-    @staticmethod
-    def _filepath_for_samplelist(name) -> pathlib.Path:
-        return SAMPLES_DIRECTORY / f'{name}.samples'
+        """Returns the samples accumulated so far."""
+        return self.dataset.samples
 
     def load_samples(self) -> bool:
-        filepath = HandeyeSampler._filepath_for_samplelist(self.handeye_parameters.name)
-        with open(filepath) as f:
-            m = yaml.full_load(f.read())
-            ret = SampleList()
-            set_message_fields(ret, m)
-            self.samples = ret
-        return True
+        loaded = self.dataset.load()
+        if loaded:
+            self.samples = self.dataset.samples
+        return loaded
 
     def save_samples(self) -> bool:
-        if not os.path.exists(SAMPLES_DIRECTORY):
-            os.makedirs(SAMPLES_DIRECTORY)
-        filepath = HandeyeSampler._filepath_for_samplelist(self.handeye_parameters.name)
-        with open(filepath, 'w') as f:
-            f.write(message_to_yaml(self.samples))
-        return True
+        return self.dataset.save()
