@@ -2,9 +2,10 @@ import cv2
 import numpy as np
 
 import transforms3d as tfs
-from geometry_msgs.msg import Transform, Vector3, Quaternion
+from geometry_msgs.msg import Quaternion, Transform, Vector3
 
 from easy_handeye2.handeye_calibration import HandeyeCalibration
+from easy_handeye2.handeye_refinement import CornerPnPRefiner, DaniilidisBundleAdjuster
 
 
 class HandeyeCalibrationBackendOpenCV(object):
@@ -18,6 +19,10 @@ class HandeyeCalibrationBackendOpenCV(object):
         'Andreff': cv2.CALIB_HAND_EYE_ANDREFF,
         'Daniilidis': cv2.CALIB_HAND_EYE_DANIILIDIS,
     }
+
+    def __init__(self):
+        self.pnp_refiner = CornerPnPRefiner()
+        self.bundle_adjuster = DaniilidisBundleAdjuster()
 
     @staticmethod
     def _msg_to_opencv(transform_msg):
@@ -59,7 +64,7 @@ class HandeyeCalibrationBackendOpenCV(object):
         :rtype: easy_handeye.handeye_calibration.HandeyeCalibration
         """
         if algorithm is None:
-            algorithm = 'Tsai-Lenz'
+            algorithm = 'Daniilidis'
 
         node.get_logger().info('OpenCV backend calibrating with algorithm {}'.format(algorithm))
 
@@ -90,6 +95,13 @@ class HandeyeCalibrationBackendOpenCV(object):
 
         result = Transform(translation=Vector3(x=hctx, y=hcty, z=hctz),
                            rotation=Quaternion(x=hcqx, y=hcqy, z=hcqz, w=hcqw))
+
+        if algorithm == 'Daniilidis':
+            refined_samples = self.pnp_refiner.refine_samples(samples)
+            node.get_logger().info('Corner-based PnP refinement applied to samples')
+            refined_transform = self.bundle_adjuster.refine(result, refined_samples)
+            node.get_logger().info('Bundle adjustment refinement complete')
+            result = refined_transform
 
         ret = HandeyeCalibration(parameters=handeye_parameters, transform=result)
 

@@ -29,10 +29,12 @@ setup(
                 'handeye_server_robot = easy_handeye2.handeye_server_robot:main',
                 'handeye_publisher = easy_handeye2.handeye_publisher:main',
                 'handeye_calibration_commander = easy_handeye2.handeye_calibration_commander:main',
+                'apriltag_history_publisher = easy_handeye2.apriltag_history_publisher:main',
      ],
    },
   scripts = [
       'scripts/rqt_calibrator.py',
       'scripts/rqt_evaluator.py',
+      'scripts/handeye_cli.py',
   ]
 )
