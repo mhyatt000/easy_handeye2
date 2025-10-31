@@ -1,0 +1,4 @@
+uint32 max_samples
+---
+bool success
+easy_handeye2_msgs/SampleList samples

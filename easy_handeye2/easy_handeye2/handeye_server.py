@@ -36,6 +36,7 @@ class HandeyeServer(rclpy.node.Node):
         self.get_sample_list_service = None
         self.take_sample_service = None
         self.remove_sample_service = None
+        self.prune_sample_service = None
         self.save_samples_service = None
         self.load_samples_service = None
         self.compute_calibration_service = None
@@ -61,6 +62,8 @@ class HandeyeServer(rclpy.node.Node):
         self.take_sample_service = self.create_service(ehm.srv.TakeSample, hec.TAKE_SAMPLE_TOPIC, self.take_sample_srv_callback)
         self.remove_sample_service = self.create_service(ehm.srv.RemoveSample, hec.REMOVE_SAMPLE_TOPIC,
                                                          self.remove_sample_srv_callback)
+        self.prune_sample_service = self.create_service(ehm.srv.PruneSamples, hec.PRUNE_SAMPLES_TOPIC,
+                                                        self.prune_samples_srv_callback)
         self.save_samples_service = self.create_service(ehm.srv.SaveSamples, hec.SAVE_SAMPLES_TOPIC,
                                                         self.save_samples)
         self.load_samples_service = self.create_service(ehm.srv.LoadSamples, hec.LOAD_SAMPLES_TOPIC,
@@ -140,6 +143,15 @@ class HandeyeServer(rclpy.node.Node):
         except IndexError:
             self.get_logger().err('Invalid index ' + req.sample_index)
         response.samples = self._retrieve_sample_list()
+        return response
+
+    def prune_samples_srv_callback(self, req: ehm.srv.PruneSamples.Request, response: ehm.srv.PruneSamples.Response):
+        try:
+            response.samples = self.sampler.prune_samples(int(req.max_samples))
+            response.success = True
+        except ValueError as exc:
+            self.get_logger().error(f'Failed to prune samples: {exc}')
+            response.success = False
         return response
 
     def save_samples(self, _: ehm.srv.SaveSamples.Request, response: ehm.srv.SaveSamples.Response):

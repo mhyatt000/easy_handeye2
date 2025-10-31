@@ -2,6 +2,8 @@ import os
 import pathlib
 from typing import Optional
 
+import numpy as np
+
 import easy_handeye2_msgs.msg
 import tf2_ros
 import yaml
@@ -13,6 +15,7 @@ from rclpy.time import Duration, Time
 
 from easy_handeye2 import SAMPLES_DIRECTORY
 from easy_handeye2.handeye_calibration import HandeyeCalibrationParameters
+from easy_handeye2.pose_metrics import sample_distance
 
 import easy_handeye2
 
@@ -41,7 +44,7 @@ class HandeyeSampler:
         """
 
         # internal input data
-        self.samples: easy_handeye2.msg.SampleList = SampleList()
+        self.samples: SampleList = SampleList()
         """
         list of acquired samples
         """
@@ -149,6 +152,59 @@ class HandeyeSampler:
         """
         Returns the samples accumulated so far.
         """
+        return self.samples
+
+    @staticmethod
+    def _build_distance_matrix(samples: list[easy_handeye2_msgs.msg.Sample]) -> np.ndarray:
+        count = len(samples)
+        distances = np.zeros((count, count))
+        for i in range(count):
+            for j in range(i + 1, count):
+                d = sample_distance(samples[i], samples[j])
+                distances[i, j] = d
+                distances[j, i] = d
+        return distances
+
+    @staticmethod
+    def _initial_farthest_index(distances: np.ndarray) -> int:
+        if len(distances) <= 1:
+            return 0
+        avg = distances.mean(axis=1)
+        return int(np.argmax(avg))
+
+    @staticmethod
+    def _next_farthest_index(selected: list[int], distances: np.ndarray, remaining: set[int]) -> int:
+        best_idx = None
+        best_score = -1.0
+        for idx in remaining:
+            score = min(distances[idx, chosen] for chosen in selected)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        return int(best_idx)
+
+    def prune_samples(self, max_samples: int) -> easy_handeye2_msgs.msg.SampleList:
+        if max_samples < 0:
+            raise ValueError('max_samples must be non-negative')
+
+        current = list(self.samples.samples)
+        if max_samples == 0:
+            self.samples.samples = []
+            return self.samples
+        if len(current) <= max_samples:
+            return self.samples
+
+        distances = HandeyeSampler._build_distance_matrix(current)
+        selected = [HandeyeSampler._initial_farthest_index(distances)]
+        remaining = set(range(len(current))) - set(selected)
+
+        while len(selected) < max_samples and remaining:
+            idx = HandeyeSampler._next_farthest_index(selected, distances, remaining)
+            selected.append(idx)
+            remaining.remove(idx)
+
+        selected.sort()
+        self.samples.samples = [current[i] for i in selected]
         return self.samples
 
     @staticmethod
