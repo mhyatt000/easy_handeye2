@@ -11,6 +11,10 @@ from easy_handeye2_msgs.msg import Sample, SampleList
 import rclpy
 from rclpy.time import Duration, Time
 
+from geometry_msgs.msg import Quaternion, Transform, Vector3
+import numpy as np
+import transforms3d as tfs
+
 from easy_handeye2 import SAMPLES_DIRECTORY
 from easy_handeye2.handeye_calibration import HandeyeCalibrationParameters
 
@@ -45,7 +49,9 @@ class HandeyeSampler:
         """
         list of acquired samples
         """
-
+        self.samples.parameters = handeye_parameters
+        self.sample_metadata: list[dict] = []
+        
     def wait_for_tf_init(self) -> bool:
         """
         Waits until all needed frames are present in tf.
@@ -84,7 +90,7 @@ class HandeyeSampler:
         self.node.get_logger().info('All expected transforms are available on tf; ready to take samples')
         return True
 
-    def _get_transforms(self, time: Optional[rclpy.time.Time] = None) -> Sample | None:
+    def _get_transforms(self, time: Optional[rclpy.time.Time] = None) -> tuple[Sample, dict] | None:
         """
         Samples the transforms at the given time.
         """
@@ -111,10 +117,15 @@ class HandeyeSampler:
         ret = Sample()
         ret.robot = robot.transform
         ret.tracking = tracking.transform
-        return ret
+        metadata = self._build_metadata(robot)
+        return ret, metadata
 
     def current_transforms(self) -> Sample | None:
-        return self._get_transforms()
+        sampled = self._get_transforms()
+        if sampled is None:
+            return None
+        sample, _ = sampled
+        return sample
 
     def take_sample(self) -> bool:
         """
@@ -123,14 +134,16 @@ class HandeyeSampler:
         try:
             self.node.get_logger().info("Taking a sample...")
             self.node.get_logger().info("all frames: " + self.tfBuffer.all_frames_as_string())
-            sample = self._get_transforms()
-            if sample is None:
+            sampled = self._get_transforms()
+            if sampled is None:
                 return False
 
             self.node.get_logger().info("Got a sample")
+            sample, metadata = sampled
             new_samples = self.samples.samples
             new_samples.append(sample)
             self.samples.samples = new_samples
+            self.sample_metadata.append(metadata)
             return True
         except:
             return False
@@ -143,6 +156,7 @@ class HandeyeSampler:
             new_samples = self.samples.samples
             del new_samples[index]
             self.samples.samples = new_samples
+            del self.sample_metadata[index]
         return len(self.samples.samples)
 
     def get_samples(self) -> easy_handeye2_msgs.msg.SampleList:
@@ -158,16 +172,117 @@ class HandeyeSampler:
     def load_samples(self) -> bool:
         filepath = HandeyeSampler._filepath_for_samplelist(self.handeye_parameters.name)
         with open(filepath) as f:
-            m = yaml.full_load(f.read())
+            loaded = yaml.safe_load(f.read())
+
+        if isinstance(loaded, dict) and 'samples' in loaded:
+            self._load_new_format(loaded)
+        else:
             ret = SampleList()
-            set_message_fields(ret, m)
+            set_message_fields(ret, loaded)
             self.samples = ret
+            self.samples.parameters = self.handeye_parameters
+            self.sample_metadata = []
+            self._ensure_metadata_length()
         return True
 
     def save_samples(self) -> bool:
         if not os.path.exists(SAMPLES_DIRECTORY):
             os.makedirs(SAMPLES_DIRECTORY)
         filepath = HandeyeSampler._filepath_for_samplelist(self.handeye_parameters.name)
+        self._ensure_metadata_length()
+        payload = {
+            'parameters': yaml.safe_load(message_to_yaml(self.handeye_parameters)) if self.handeye_parameters else None,
+            'samples': [self._serialize_sample(sample, metadata)
+                        for sample, metadata in zip(self.samples.samples, self.sample_metadata)],
+        }
         with open(filepath, 'w') as f:
-            f.write(message_to_yaml(self.samples))
+            yaml.safe_dump(payload, f)
         return True
+
+    def _load_new_format(self, payload: dict):
+        parameters = payload.get('parameters')
+        if parameters:
+            set_message_fields(self.samples.parameters, parameters)
+        else:
+            self.samples.parameters = self.handeye_parameters
+
+        deserialized_samples = []
+        metadata: list[dict] = []
+        for item in payload.get('samples', []):
+            deserialized_samples.append(self._deserialize_sample(item))
+            metadata.append(self._extract_metadata(item))
+
+        self.samples.samples = deserialized_samples
+        self.sample_metadata = metadata
+        self._ensure_metadata_length()
+
+    @staticmethod
+    def _serialize_sample(sample: Sample, metadata: dict) -> dict:
+        return {
+            'T_base_ee': HandeyeSampler._transform_to_matrix(sample.robot),
+            'T_cam_tag': HandeyeSampler._transform_to_matrix(sample.tracking),
+            'covariances': metadata.get('covariances'),
+            'image_name': metadata.get('image_name'),
+            'stamp': metadata.get('stamp'),
+        }
+
+    @staticmethod
+    def _deserialize_sample(payload: dict) -> Sample:
+        sample = Sample()
+        sample.robot = HandeyeSampler._matrix_to_transform(payload['T_base_ee'])
+        sample.tracking = HandeyeSampler._matrix_to_transform(payload['T_cam_tag'])
+        return sample
+
+    @staticmethod
+    def _extract_metadata(payload: dict) -> dict:
+        return {
+            'covariances': payload.get('covariances'),
+            'image_name': payload.get('image_name'),
+            'stamp': payload.get('stamp'),
+        }
+
+    @staticmethod
+    def _build_metadata(robot_transform) -> dict:
+        return {
+            'covariances': None,
+            'image_name': None,
+            'stamp': HandeyeSampler._stamp_to_dict(getattr(robot_transform, 'header', None)),
+        }
+
+    @staticmethod
+    def _stamp_to_dict(header) -> dict | None:
+        if header is None:
+            return None
+        stamp = header.stamp
+        if stamp is None:
+            return None
+        return {'sec': int(stamp.sec), 'nanosec': int(stamp.nanosec)}
+
+    def _ensure_metadata_length(self):
+        while len(self.sample_metadata) < len(self.samples.samples):
+            self.sample_metadata.append({'covariances': None, 'image_name': None, 'stamp': None})
+
+    @staticmethod
+    def _transform_to_matrix(transform: Transform) -> list[list[float]]:
+        rotation = tfs.quaternions.quat2mat((transform.rotation.w,
+                                             transform.rotation.x,
+                                             transform.rotation.y,
+                                             transform.rotation.z))
+        translation = np.array((transform.translation.x,
+                                transform.translation.y,
+                                transform.translation.z))
+        matrix = np.eye(4)
+        matrix[:3, :3] = rotation
+        matrix[:3, 3] = translation
+        return matrix.tolist()
+
+    @staticmethod
+    def _matrix_to_transform(matrix: list[list[float]]) -> Transform:
+        mat = np.array(matrix, dtype=float)
+        rot = mat[:3, :3]
+        tr = mat[:3, 3]
+        qw, qx, qy, qz = tfs.quaternions.mat2quat(rot)
+        return Transform(
+            translation=Vector3(x=float(tr[0]), y=float(tr[1]), z=float(tr[2])),
+            rotation=Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw)),
+        )
