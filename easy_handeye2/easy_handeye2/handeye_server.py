@@ -11,6 +11,7 @@ from std_msgs import msg
 import easy_handeye2 as hec
 from easy_handeye2.handeye_calibration import save_calibration, HandeyeCalibrationParametersProvider
 from easy_handeye2.handeye_calibration_backend_opencv import HandeyeCalibrationBackendOpenCV
+from easy_handeye2.handeye_metrics import save_metrics_report
 from easy_handeye2.handeye_sampler import HandeyeSampler
 
 
@@ -25,9 +26,15 @@ class HandeyeServer(rclpy.node.Node):
 
         self.sampler = HandeyeSampler(self, handeye_parameters=self.parameters)
         self.setup_timer = self.create_timer(2.0, self.setup_services_and_topics)
+        if self.sampler.load_samples():
+            self.get_logger().info(f'Resumed {len(self.sampler.samples.samples)} samples from disk')
+        if self.sampler.auto_snapshot_period > 0.0:
+            self.get_logger().info(
+                f'Auto snapshot enabled with period {self.sampler.auto_snapshot_period:.2f}s and gating thresholds '
+                f'{self.sampler.dataset.gate.config}')
 
         self.calibration_backends = {'OpenCV': HandeyeCalibrationBackendOpenCV()}
-        self.calibration_algorithm = 'OpenCV/Tsai-Lenz'
+        self.calibration_algorithm = 'OpenCV/Daniilidis'
 
         # setup calibration services and topics
         self.list_algorithms_service = None
@@ -44,6 +51,7 @@ class HandeyeServer(rclpy.node.Node):
         self.remove_last_sample_topic = None
 
         self.last_calibration = None
+        self.last_metrics = None
 
     def setup_services_and_topics(self):
         if not self.sampler.wait_for_tf_init():
@@ -173,6 +181,14 @@ class HandeyeServer(rclpy.node.Node):
             return response
         response.valid = True
         response.calibration = self.last_calibration
+        try:
+            self.last_metrics = save_metrics_report(self.parameters, self.last_calibration, samples)
+            mean_trans = float(self.last_metrics.translation_errors.mean()) if self.last_metrics.translation_errors.size else 0.0
+            mean_rot = float(self.last_metrics.rotation_errors_deg.mean()) if self.last_metrics.rotation_errors_deg.size else 0.0
+            self.get_logger().info(f'Calibration metrics stored at {self.last_metrics.report_path}')
+            self.get_logger().info(f'Mean residual: {mean_trans:.5f} m / {mean_rot:.3f} deg')
+        except Exception as exc:  # pragma: no cover - plotting failure should not crash
+            self.get_logger().warn(f'Failed to compute metrics: {exc}')
         return response
 
     def save_calibration(self, _, response: ehm.srv.SaveCalibration.Response):

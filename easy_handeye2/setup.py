@@ -35,5 +35,6 @@ setup(
   scripts = [
       'scripts/rqt_calibrator.py',
       'scripts/rqt_evaluator.py',
+      'scripts/handeye_cli.py',
   ]
 )
