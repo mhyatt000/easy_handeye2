@@ -4,6 +4,9 @@ import pathlib
 import numpy as np
 import transforms3d as tfs
 from ament_index_python import get_resource
+from fiducial_msgs.msg import FiducialTransformArray
+from rclpy.exceptions import ParameterAlreadyDeclaredException
+from rclpy.time import Time
 from easy_handeye2.handeye_calibration import HandeyeCalibrationParametersProvider
 from easy_handeye2.handeye_client import HandeyeClient
 from python_qt_binding import loadUi
@@ -20,6 +23,9 @@ def format_sample(sample):
 
 
 class RqtHandeyeCalibratorWidget(QWidget):
+    AUTO_COLLECT_COVARIANCE_THRESHOLD = 5e-04
+    AUTO_COLLECT_MAX_STALENESS_SEC = 0.5
+
     def __init__(self, parent, context):
         super(RqtHandeyeCalibratorWidget, self).__init__()
         self._parent = parent
@@ -30,6 +36,41 @@ class RqtHandeyeCalibratorWidget(QWidget):
         self.parameters = self.parameters_provider.read()
 
         self._current_transforms = None
+        self._latest_covariance = None
+        self._latest_covariance_time = None
+        self._auto_collect_threshold = self.AUTO_COLLECT_COVARIANCE_THRESHOLD
+        self._auto_collect_max_staleness = self.AUTO_COLLECT_MAX_STALENESS_SEC
+        self._auto_collect_ready = True
+
+        try:
+            self._node.declare_parameter('tag_detection_topic', '/fiducial_transforms')
+        except ParameterAlreadyDeclaredException:
+            pass
+        tag_topic_param = self._node.get_parameter('tag_detection_topic').get_parameter_value().string_value
+        if not tag_topic_param:
+            tag_topic_param = '/fiducial_transforms'
+        self._tag_detection_topic = tag_topic_param
+
+        try:
+            self._node.declare_parameter('auto_collect_covariance_threshold', self.AUTO_COLLECT_COVARIANCE_THRESHOLD)
+        except ParameterAlreadyDeclaredException:
+            pass
+        threshold_param = self._node.get_parameter('auto_collect_covariance_threshold').get_parameter_value().double_value
+        if threshold_param > 0.0:
+            self._auto_collect_threshold = threshold_param
+
+        try:
+            self._node.declare_parameter('auto_collect_max_staleness', self.AUTO_COLLECT_MAX_STALENESS_SEC)
+        except ParameterAlreadyDeclaredException:
+            pass
+        staleness_param = self._node.get_parameter('auto_collect_max_staleness').get_parameter_value().double_value
+        if staleness_param > 0.0:
+            self._auto_collect_max_staleness = staleness_param
+
+        self._tag_detection_sub = self._node.create_subscription(FiducialTransformArray,
+                                                                 self._tag_detection_topic,
+                                                                 self._tag_detection_callback,
+                                                                 10)
 
         # Process standalone plugin command-line arguments
         from argparse import ArgumentParser
@@ -185,6 +226,46 @@ class RqtHandeyeCalibratorWidget(QWidget):
         rotation_has_moved = RqtHandeyeCalibratorWidget._rotation_distance(t1, t2) > ROTATION_TOLERANCE_RAD
         return translation_has_moved or rotation_has_moved
 
+    @staticmethod
+    def _covariance_score(covariance_values):
+        indices = (0, 7, 14, 21, 28, 35)
+        return max(abs(covariance_values[i]) for i in indices)
+
+    def _tag_detection_callback(self, msg: FiducialTransformArray):
+        if not msg.transforms:
+            self._latest_covariance = None
+            self._latest_covariance_time = None
+            self._auto_collect_ready = True
+            return
+
+        scores = [self._covariance_score(transform.transform.covariance) for transform in msg.transforms]
+        self._latest_covariance = min(scores)
+        self._latest_covariance_time = Time.from_msg(msg.header.stamp)
+
+    def _covariance_is_low(self):
+        if self._latest_covariance is None:
+            return False
+        if self._latest_covariance_time is None:
+            return False
+        now = self._node.get_clock().now()
+        age = now - self._latest_covariance_time
+        if age.nanoseconds > int(self._auto_collect_max_staleness * 1e9):
+            return False
+        return self._latest_covariance <= self._auto_collect_threshold
+
+    def _update_tag_status_label(self, robot_is_moving):
+        if self._latest_covariance is None:
+            detection_text = 'Detection covariance: n/a'
+        else:
+            detection_text = f'Detection covariance: {self._latest_covariance:.2e}'
+            if self._covariance_is_low():
+                detection_text += ' (ok)'
+            else:
+                detection_text += f' (> {self._auto_collect_threshold:.2e})'
+
+        movement_text = 'Robot moving' if robot_is_moving else 'Robot steady'
+        self._widget.tagStatusLabel.setText(f'{detection_text}\n{movement_text}')
+
     def _check_still_moving(self, new_transforms):
         if self._current_transforms is None:
             self._current_transforms = new_transforms
@@ -200,16 +281,29 @@ class RqtHandeyeCalibratorWidget(QWidget):
 
     def _updateUI(self):
         new_transforms = self.client.get_current_transforms()
-        if new_transforms is None or self._check_still_moving(new_transforms):
+        if new_transforms is None:
             self._widget.takeButton.setEnabled(False)
+            self._auto_collect_ready = True
+            self._update_tag_status_label(True)
+            return
+
+        robot_is_moving = self._check_still_moving(new_transforms)
+        if robot_is_moving:
+            self._widget.takeButton.setEnabled(False)
+            self._auto_collect_ready = True
         else:
             self._widget.takeButton.setEnabled(True)
+            if (self._widget.autoCollectCheckBox.isChecked() and self._auto_collect_ready and
+                    self._covariance_is_low()):
+                self.handle_take_sample()
+        self._update_tag_status_label(robot_is_moving)
 
     def handle_take_sample(self):
         sample_list = self.client.take_sample()
         self._display_sample_list(sample_list)
         self._widget.saveButton.setEnabled(False)
         self.handle_compute_calibration()
+        self._auto_collect_ready = False
 
     def handle_remove_sample(self):
         index = self._widget.sampleListWidget.currentRow()

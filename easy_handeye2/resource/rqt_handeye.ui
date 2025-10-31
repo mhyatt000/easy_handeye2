@@ -43,6 +43,26 @@
           </property>
          </widget>
         </item>
+        <item>
+         <widget class="QCheckBox" name="autoCollectCheckBox">
+          <property name="text">
+           <string>Auto-collect when stable</string>
+          </property>
+          <property name="checked">
+           <bool>false</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="tagStatusLabel">
+          <property name="text">
+           <string>Detection covariance: n/a</string>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>
