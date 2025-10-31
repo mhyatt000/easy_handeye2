@@ -1,3 +1,5 @@
+thank you marcoesposito1988/easy_handeye2
+* codex doesnt help with forked repos
 
 # easy_handeye2: automated, hardware-independent Hand-Eye Calibration for ROS2
 
